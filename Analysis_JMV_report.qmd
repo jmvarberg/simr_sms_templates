@@ -1,0 +1,230 @@
+---
+title: "Proteomics Analysis Report"
+author: "JM Varberg"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+format:
+    html:
+        toc: true
+        toc-location: left
+        link-external-icon: true
+        link-external-newwindo: true
+        code-fold: true
+        code-overflow: scroll
+        code-tools: true
+        highlight-style: github
+        code-copy: hover
+        code-link: true
+        theme:
+            light: flatly
+            dark: darkly
+        comments:
+            hypothesis: 
+                theme: clean
+        execute:
+            echo: true
+            output: true
+            error: false
+            message: false
+            warning: false
+        self-contained: true
+server: shiny
+---
+
+# Packages
+
+```{r Load required packages}
+library(tidyverse)
+library(data.table)
+library(ggpubr)
+library(cowplot)
+library(rstatix)
+library(ggforce)
+library(SummarizedExperiment)
+library(janitor)
+library(tidySummarizedExperiment)
+library(pheatmap)
+library(ComplexHeatmap)
+library(NormalyzerDE)
+library(jmvtools)
+
+#remotes::install_github('yihui/xfun')
+# embed_file() requires a few more packages
+xfun::pkg_load2(c('htmltools', 'mime'))
+
+```
+
+# Objective
+
+To identify cross-link pairs that are different in abundance between brain regions and/or time points
+
+
+
+# Data Clean Up
+
+
+
+# Data Processing
+
+## Read in raw data
+
+```{r Search for and read in raw data file from ProteomeDiscoverer}
+
+#Check for the presence of a file ending in "Proteins.txt" in the directory, and if it exists, read in as data frame.
+
+pd_protein_file <- list.files(path = "./", pattern = "Proteins.txt")
+
+if (length(pd_protein_file == 1)) {
+    pd_report <- fread(pd_protein_file)
+    #clean up column names
+    colnames(pd_report) <- snakecase::to_any_case(colnames(pd_report), case="snake")
+    
+    
+} else { print("No Proteins.txt file in directory")}
+
+#check for presence of sample file outlining the experimental design
+sample_file <- list.files(path = "./", pattern = "sample_table.csv")
+
+if (length(sample_file == 1)) {
+    design <- fread(sample_file)
+    design <- design |> 
+        mutate(across(.cols=everything(), ~ snakecase::to_any_case(.x, case="snake"))) 
+        #mutate(across(.cols=everything(), ~ make.names(.x))) #ensures that everything has syntactically correct names for R (can't start with number, etc.)
+    
+    
+} else { print("No 'sample_table.csv' file in directory")}
+
+```
+
+## Extract sample information, feature information and abundance values
+
+Extracting information here to be used later to build into a Summarized Experiment object.
+
+```{r Set up column and row data and extract raw data}
+
+colData <- design |> mutate(label = paste(condition, replicate, sep="."))
+
+rowData <- data.frame(accession = pd_report$accession, gene = pd_report$gene_symbol)
+
+#get raw abundances for first assay slot
+raw_abundances <- pd_report |>
+    select(all_of(design$sample)) |> 
+    mutate(accession = pd_report$accession) |> 
+    column_to_rownames(var = "accession") |> 
+    as.matrix()
+
+knitr::kable(colData, caption = "Design table (used as colData)")
+
+```
+
+
+## Construct a SummarizedExperiment Object
+
+Here we generate a SummarizedExperiment Object containing the raw abundances from PD and annotations about sample name, group/condition, and replicate.
+
+We will use this object as input into `NormalyzerDE` for automating the process of performing multiple normalizations and ultimately for differential expression analysis.
+
+```{r Construct SummarizedExperiment Object}
+#put everything into a Summarized Experiment object
+se <- SummarizedExperiment(assay=list(raw=raw_abundances), colData = colData, rowData = list(accession = rownames(raw_abundances)))
+se
+xfun::embed_file("./NormalyzerDE_testing/Raw_abundances_SummarizedExperiment_object.Rds")
+
+#save out raw abundances SE object as Rds
+saveRDS(se, file = "./NormalyzerDE_testing/Raw_abundances_SummarizedExperiment_object.Rds")
+
+```
+
+## Normalization and Comparison of Methods
+
+We now use the package [`NormalyzerDE`](https://www.bioconductor.org/packages/release/bioc/vignettes/NormalyzerDE/inst/doc/vignette.pdf) for doing comparisons of normalization methods and differential expression analysis.
+
+The first step of the NormalyzerDE analysis is performing the normalizations and generating an output PDF report containing metrics for comparing normalization methods. This is accomplished in the following code chunk, where we provide the SummarizedExperiment object (`se`) as input to the `NormalyzerDE::normalyzer()` function. This will create a subdirectory in the current working directory to store the output. This output includes the normalized data, each named according to the method used and saved as `.txt` files, as well as a PDF summary report of the results.
+
+This document should be used to visually inspect the different methods and ultimately select a method for using in the downstream analysis for differential expression testing.
+
+```{r Run Normalization with Normalyzer}
+#BiocManager::install("NormalyzerDE")
+library(NormalyzerDE)
+outDir <- "./NormalyzerDE"
+if (!dir.exists(outDir)) {
+    dir.create(outDir)
+} else {
+    print("Output will be written to existing subdirectory 'NormalyzerDE'")
+}
+normalyzer(jobName="Normalization_results", experimentObj = se, sampleColName = "sample", groupColName = "condition", outputDir = "./NormalyzerDE")
+
+```
+
+
+```{r Embedded Normalization Results PDF}
+xfun::embed_file("./NormalyzerDE/Normalization_results/Norm-report-Normalization_results.pdf")
+```
+
+### Selection of Normalizaiton Method and DEA testing with limma
+
+After visualizing the NormalyzerDE report, select a normalization method and perform the down-stream differential expression analysis.
+
+As a default, we use the median normalized data. Default values for DEA testing include:
+
+* Performing all possible pair-wise comparisons based on experimental conditions/groups.
+* Requiring a protein/feature to be present in at least half of the replicates within a condition/group.
+* An FDR threshold to filter for significance at a default value of 0.01.
+* A fold-change threshold to filter for changes in abundance, set at a default value of log2FC >= 1.
+
+
+```{r Read in normalized data, make new SE object and run DEA}
+
+#read in normalized dataset
+norm_data <- fread("./NormalyzerDE/Normalization_results/median-normalized.txt")
+
+#need to convert to matrix with IDs/accessions as rownames
+norm_data_mat <- norm_data |> 
+    column_to_rownames(var="accession") |> 
+    as.matrix()
+
+#make SE object with normalized data
+se_norm <- SummarizedExperiment(assay=list(norm=norm_data_mat), colData = colData, rowData = list(accession = rownames(norm_data_mat)))
+se_norm
+
+#save out normalized SE object as Rds
+saveRDS(se_norm, "./NormalyzerDE/Normalized_SummarizedExperiment_object.Rds")
+xfun::embed_file("./NormalyzerDE/Normalized_SummarizedExperiment_object.Rds")
+
+#setup output directory for DEA
+DEA_outDir <- "./NormalyzerDE/DEA_output/"
+if (!dir.exists(DEA_outDir)) {
+    dir.create(DEA_outDir)
+} else {
+    print("Output will be written to existing subdirectory 'NormalyzerDE_testing/DEA_output'")
+}
+
+#generate all pairwise comparisons as character list
+conditions <- unique(design$condition)
+contrastVec <- apply(combn(conditions,2), 2, paste, collapse='-')
+
+#get the number of replicates
+numReps <- nrow(design)/length(unique(design$condition))
+
+#run DEA with single NormalyzerDE function
+normalyzerDE(jobName = "DEA_output", comparisons = contrastVec, experimentObj = se_norm, outputDir = DEA_outDir, logTrans=FALSE, type = "limma", sampleCol = "sample", condCol = "condition", leastRepCount = numReps/2, sigThres = 0.01, sigThresType = "fdr", log2FoldThres = 1)
+
+```
+
+
+```{r Embedd NormalyzerDE DEA Report}
+xfun::embed_file("./NormalyzerDE/DEA_output/Norm-stats-report-DEA_output.pdf")
+```
+
+## Interactive Results Table
+
+```{r}
+dea_results <- data.table::fread("./NormalyzerDE/DEA_output/DEA_output_stats.tsv")
+dea_results |> 
+    jmv_datatables()
+
+```
+
+
+
+
+
